@@ -57,6 +57,8 @@ type InstallResult struct {
 
 	Background              OpenCodeBackgroundResolution
 	BackgroundPolicyEnabled bool
+
+	PiBackground PiBackgroundResolution
 }
 
 var (
@@ -157,11 +159,19 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	if err != nil {
 		return InstallResult{}, fmt.Errorf("prepare OpenCode background activation: %w", err)
 	}
+	piBackground, err := resolvePiBackgroundCLI(flags.PiBackgroundSubagentsSet, flags.PiBackgroundSubagents, persistedState)
+	if err != nil {
+		return InstallResult{}, err
+	}
+	piBackgroundProjection := preparePiBackgroundProjection(homeDir, &piBackground, containsAgent(resolved.Agents, model.AgentPi))
 
 	review := planner.BuildReviewPayload(input.Selection, resolved)
 	stagePlan := buildStagePlan(input.Selection, resolved)
 	if backgroundActivation != nil {
 		stagePlan.Apply = append(stagePlan.Apply, noopStep{id: "opencode:background-activation"})
+	}
+	if piBackgroundProjection != nil {
+		stagePlan.Apply = append(stagePlan.Apply, noopStep{id: "pi:background-projection"})
 	}
 
 	result := InstallResult{
@@ -172,6 +182,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		Dependencies: detection.Dependencies,
 		DryRun:       input.DryRun,
 		Background:   background,
+		PiBackground: piBackground,
 	}
 	result.Background.activationPlan = backgroundActivation
 	if backgroundActivation != nil {
@@ -189,14 +200,6 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 				"will be written to each selected agent's global config directory and will affect ALL workspaces for those agents on this machine.\n"+
 				"To install only into the current workspace, rerun with --scope=workspace.\n\n")
 	}
-	var openCodeRuntime *state.OpenCodeRuntimeProvenance
-	if hasOpenCodeReviewerPlugin(input.Selection.Agents) {
-		openCodeRuntime, err = captureOpenCodeRuntimeProvenance()
-		if err != nil {
-			return result, fmt.Errorf("capture OpenCode reviewer runtime provenance: %w", err)
-		}
-	}
-
 	runtime, err := newInstallRuntime(homeDir, input.Scope, input.Channel, input.Selection, resolved, profile)
 	if err != nil {
 		return result, err
@@ -213,6 +216,7 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	runtime.background = background
 	runtime.backgroundActivation = backgroundActivation
 	runtime.runtimeReady = backgroundActivation != nil && backgroundActivation.Capability().Ready()
+	runtime.piBackgroundProjection = piBackgroundProjection
 
 	stagePlan = runtime.stagePlan()
 	result.Plan = stagePlan
@@ -235,6 +239,9 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 	result.Verify = withPostInstallNotes(result.Verify, resolved)
 	result.Verify = withOpenCodeBackgroundPending(result.Verify, background, runtime.runtimeReady, resolved.Agents)
 	result.Verify = withOpenCodeBackgroundActivationNote(result.Verify, background, resolved.Agents)
+	if plan := piBackground.projectionPlan; plan != nil && plan.skipReason != "" {
+		result.Verify.FinalNote += "\n\nPi background projection skipped: " + plan.skipReason
+	}
 	result.BackgroundPolicyEnabled = runtime.runtimeReady && background.Effective == model.OpenCodeBackgroundOn
 	if backgroundActivation != nil {
 		result.Background.Activation = backgroundActivation.Report()
@@ -274,11 +281,13 @@ func RunInstall(args []string, detection system.DetectionResult) (InstallResult,
 		CodexPhaseModelAssignments:  input.Selection.CodexPhaseModelAssignments,
 		ModelAssignments:            modelAssignmentsToState(input.Selection.ModelAssignments),
 		Persona:                     string(input.Selection.Persona),
-		OpenCodeRuntimeProvenance:   openCodeRuntime,
 	}
 	newState.SetSelection(input.Selection)
 	if background.Persist != "" {
 		newState.BackgroundIntent = background.Persist
+	}
+	if piBackground.Persist != "" {
+		newState.PiBackgroundIntent = piBackground.Persist
 	}
 	writer, err := managedAssetDigest()
 	if err != nil {
@@ -332,6 +341,9 @@ func mergeFullInstallState(existing, fresh state.InstallState) state.InstallStat
 	if fresh.BackgroundIntent != "" {
 		merged.BackgroundIntent = fresh.BackgroundIntent
 	}
+	if fresh.PiBackgroundIntent != "" {
+		merged.PiBackgroundIntent = fresh.PiBackgroundIntent
+	}
 	return merged
 }
 
@@ -383,10 +395,6 @@ func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState,
 	if newState.CodexPhaseModelAssignments != nil {
 		merged.CodexPhaseModelAssignments = newState.CodexPhaseModelAssignments
 	}
-	if newState.OpenCodeRuntimeProvenance != nil {
-		provenance := *newState.OpenCodeRuntimeProvenance
-		merged.OpenCodeRuntimeProvenance = &provenance
-	}
 	if merged.SelectionConfigured {
 		if len(flags.Components) > 0 {
 			merged.Components = newState.Components
@@ -406,6 +414,9 @@ func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState,
 	}
 	if newState.BackgroundIntent != "" {
 		merged.BackgroundIntent = newState.BackgroundIntent
+	}
+	if newState.PiBackgroundIntent != "" {
+		merged.PiBackgroundIntent = newState.PiBackgroundIntent
 	}
 	return merged, nil
 }
@@ -619,7 +630,6 @@ func buildStagePlan(selection model.Selection, resolved planner.ResolvedPlan) pi
 	for _, component := range resolved.OrderedComponents {
 		apply = append(apply, noopStep{id: "component:" + string(component)})
 	}
-
 	if len(selection.Agents) == 0 && len(resolved.OrderedComponents) == 0 {
 		prepare = nil
 	}
@@ -641,6 +651,9 @@ type installRuntime struct {
 	background           OpenCodeBackgroundResolution
 	runtimeReady         bool
 	backgroundActivation *opencodeactivation.ActivationPlan
+
+	piBackgroundProjection *piBackgroundProjectionPlan
+	progress               pipeline.ProgressFunc
 }
 
 type runtimeState struct {
@@ -739,6 +752,9 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 	if r.backgroundActivation != nil {
 		apply = append(apply, openCodeBackgroundActivationStep{id: "opencode:background-activation", plan: r.backgroundActivation, state: r.state, ready: &r.runtimeReady})
 	}
+	if r.piBackgroundProjection != nil {
+		apply = append(apply, piBackgroundProjectionStep{id: "pi:background-projection", plan: r.piBackgroundProjection})
+	}
 
 	// Before installing components, ensure modular agents have their system prompt hub.
 	// This ensures that SDD or Engram can inject their modules even if Persona is skipped.
@@ -749,8 +765,13 @@ func (r *installRuntime) stagePlan() pipeline.StagePlan {
 	}
 
 	for _, agent := range r.resolved.Agents {
-
-		apply = append(apply, agentInstallStep{id: "agent:" + string(agent), agent: agent, homeDir: r.homeDir, profile: r.profile})
+		apply = append(apply, agentInstallStep{
+			id:       "agent:" + string(agent),
+			agent:    agent,
+			homeDir:  r.homeDir,
+			profile:  r.profile,
+			progress: r.progress,
+		})
 	}
 
 	for _, tool := range r.selection.CommunityTools {
@@ -1207,10 +1228,11 @@ func rollbackRoots(homeDir, workspaceDir string) []string {
 }
 
 type agentInstallStep struct {
-	id      string
-	agent   model.AgentID
-	homeDir string
-	profile system.PlatformProfile
+	id       string
+	agent    model.AgentID
+	homeDir  string
+	profile  system.PlatformProfile
+	progress pipeline.ProgressFunc
 }
 
 type openCodePluginInstallStep struct {
@@ -1230,33 +1252,25 @@ func (s agentInstallStep) ID() string {
 	return s.id
 }
 
-// Run adapts the runtime already on the machine; it never acquires or
-// executes anything to put one there on the user's behalf. If the agent's
-// runtime is not detected, this refuses and names the exact command the
-// user would need to run themselves, instead of running it for them.
+// Run executes Pi's package installation commands only. Other selected
+// agents remain config targets regardless of whether their runtime is present.
 //
-// Pi is the one exception, by design: the `pi` binary itself is never
-// installed by gentle-ai (validatePiInstallPreflight refuses if it is not
-// already on PATH), but once it is present, its own `pi install ...`
-// subcommands install gentle-ai's own Pi package stack through that
-// already-present tool — the same shape as running `npm install` inside a
-// project that already has npm, not an agent-runtime install.
+// The `pi` binary itself is never installed by gentle-ai
+// (validatePiInstallPreflight refuses if it is not already on PATH), but once
+// it is present, its own `pi install ...` subcommands install gentle-ai's Pi
+// package stack through that already-present tool.
 func (s agentInstallStep) Run() error {
+	if s.agent != model.AgentPi {
+		return nil
+	}
+
 	adapter, err := agents.NewAdapter(s.agent)
 	if err != nil {
 		return fmt.Errorf("create adapter for %q: %w", s.agent, err)
 	}
 
-	installed, _, _, _, err := adapter.Detect(context.Background(), s.homeDir)
-	if err != nil {
+	if _, _, _, _, err := adapter.Detect(context.Background(), s.homeDir); err != nil {
 		return fmt.Errorf("detect agent %q: %w", s.agent, err)
-	}
-	if installed && s.agent != model.AgentPi {
-		return nil
-	}
-
-	if s.agent != model.AgentPi {
-		return refuseMissingAgentRuntime(s.agent, s.profile, adapter)
 	}
 
 	if err := installcmd.ValidateAgentInstallPreflight(s.profile, s.agent); err != nil {
@@ -1271,40 +1285,7 @@ func (s agentInstallStep) Run() error {
 		return fmt.Errorf("install command for %q resolved to an empty sequence (unsupported platform or resolver misconfiguration)", s.agent)
 	}
 
-	return runCommandSequence(commands)
-}
-
-// refuseMissingAgentRuntime reports that an agent's runtime is not present
-// instead of installing it. When the adapter can resolve the exact command a
-// user would run themselves (an npm/uv install), that command is named
-// verbatim so the refusal is actionable. When the agent cannot be installed
-// this way at all (a desktop app, a vendor-managed tool), the adapter's own
-// explanation — e.g. "agent cursor is a desktop app and cannot be installed
-// via CLI" — is surfaced instead of a silent no-op.
-func refuseMissingAgentRuntime(agent model.AgentID, profile system.PlatformProfile, adapter agents.Adapter) error {
-	commands, err := adapter.InstallCommand(profile)
-	if err != nil {
-		return err
-	}
-	if len(commands) == 0 {
-		// refusal:by-design world-action: there is no install command to name for this platform; the exit is a manual install the user performs outside Gentle-AI, not a gentle-ai command.
-		return fmt.Errorf("agent %q is not installed and Gentle-AI has no install command to suggest for this platform", agent)
-	}
-	// refusal:by-design world-action: the exit is the printed external command the user runs themselves; Gentle-AI never runs it on their behalf, so no gentle-ai command can name the resolution.
-	return fmt.Errorf(
-		"agent %q is not installed. Gentle-AI does not install agent runtimes; run this yourself, then retry:\n%s",
-		agent, formatCommandSequenceForRefusal(commands),
-	)
-}
-
-// formatCommandSequenceForRefusal renders a resolved install command
-// sequence as the human-runnable lines shown in a refusal message.
-func formatCommandSequenceForRefusal(commands [][]string) string {
-	lines := make([]string, len(commands))
-	for i, command := range commands {
-		lines[i] = "  " + strings.Join(command, " ")
-	}
-	return strings.Join(lines, "\n")
+	return runCommandSequenceWithProgress(commands, s.progress, s.id)
 }
 
 type kimiSystemPromptHubStep struct {
@@ -1753,8 +1734,8 @@ func (s componentApplyStep) Run() error {
 		return nil
 	case model.ComponentClaudeTheme:
 		for _, adapter := range adapters {
-			if _, err := theme.InjectClaudeTheme(s.homeDir, adapter); err != nil {
-				return fmt.Errorf("inject Claude theme for %q: %w", adapter.Agent(), err)
+			if _, err := theme.InjectVisualThemes(s.homeDir, adapter); err != nil {
+				return fmt.Errorf("inject visual themes for %q: %w", adapter.Agent(), err)
 			}
 		}
 		return nil
@@ -1813,11 +1794,11 @@ var tuiInstallStagePlan = func(runtime *installRuntime) pipeline.StagePlan {
 
 // ExecuteTUIInstallWithBackgroundAndOrchestrator runs a TUI install and returns
 // the orchestrator so a downstream state-persistence failure can be compensated.
-func ExecuteTUIInstallWithBackgroundAndOrchestrator(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, background model.OpenCodeBackgroundIntent, onProgress pipeline.ProgressFunc) (pipeline.ExecutionResult, *pipeline.Orchestrator) {
-	return executeTUIInstallWithBackground(homeDir, selection, resolved, profile, background, onProgress)
+func ExecuteTUIInstallWithBackgroundAndOrchestrator(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, background model.OpenCodeBackgroundIntent, piBackground model.PiBackgroundIntent, onProgress pipeline.ProgressFunc) (pipeline.ExecutionResult, *pipeline.Orchestrator) {
+	return executeTUIInstallWithBackground(homeDir, selection, resolved, profile, background, piBackground, onProgress)
 }
 
-func executeTUIInstallWithBackground(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, background model.OpenCodeBackgroundIntent, onProgress pipeline.ProgressFunc) (pipeline.ExecutionResult, *pipeline.Orchestrator) {
+func executeTUIInstallWithBackground(homeDir string, selection model.Selection, resolved planner.ResolvedPlan, profile system.PlatformProfile, background model.OpenCodeBackgroundIntent, piBackground model.PiBackgroundIntent, onProgress pipeline.ProgressFunc) (pipeline.ExecutionResult, *pipeline.Orchestrator) {
 	runtime, err := newInstallRuntime(homeDir, ScopeGlobal, ChannelStable, selection, resolved, profile)
 	if err != nil {
 		return pipeline.ExecutionResult{Err: err}, nil
@@ -1832,8 +1813,15 @@ func executeTUIInstallWithBackground(homeDir string, selection model.Selection, 
 		return pipeline.ExecutionResult{Err: fmt.Errorf("prepare OpenCode background activation: %w", err)}, nil
 	}
 	runtime.background = backgroundResolution
+	runtime.progress = onProgress
 	runtime.backgroundActivation = backgroundActivation
 	runtime.runtimeReady = backgroundActivation != nil && backgroundActivation.Capability().Ready()
+	piBackgroundResolution := PiBackgroundResolution{
+		Intent:    piBackground,
+		Effective: piBackground,
+		managed:   piBackground == model.PiBackgroundOn || piBackground == model.PiBackgroundOff,
+	}
+	runtime.piBackgroundProjection = preparePiBackgroundProjection(homeDir, &piBackgroundResolution, containsAgent(resolved.Agents, model.AgentPi))
 	orchestrator := pipeline.NewOrchestrator(pipeline.DefaultRollbackPolicy(), pipeline.WithFailurePolicy(pipeline.ContinueOnError), pipeline.WithProgressFunc(onProgress))
 	result := orchestrator.Execute(tuiInstallStagePlan(runtime))
 	runtime.state.cleanupRollbackSnapshot()
@@ -1909,6 +1897,15 @@ func ggaAvailable(profile system.PlatformProfile) bool {
 
 // runCommandSequence runs each command in the sequence one at a time, stopping on first error.
 func runCommandSequence(commands [][]string) error {
+	return runCommandSequenceWithProgress(commands, nil, "")
+}
+
+// runCommandSequenceWithProgress is the common command runner used by agent
+// installation steps. The optional callback reports each command as a generic
+// pipeline progress event; the command producer remains responsible for the
+// command content, so the pipeline does not need to know any agent-specific
+// package names.
+func runCommandSequenceWithProgress(commands [][]string, progress pipeline.ProgressFunc, stepPrefix string) error {
 	if len(commands) == 0 {
 		return fmt.Errorf("empty command sequence")
 	}
@@ -1918,8 +1915,23 @@ func runCommandSequence(commands [][]string) error {
 			return fmt.Errorf("empty command in sequence")
 		}
 
-		if err := runCommand(command[0], command[1:]...); err != nil {
+		stepID := ""
+		if stepPrefix != "" {
+			stepID = stepPrefix + ":" + strings.Join(command, " ")
+		}
+		if progress != nil {
+			progress(pipeline.ProgressEvent{StepID: stepID, Status: pipeline.StepStatusRunning})
+		}
+
+		err := runCommand(command[0], command[1:]...)
+		if err != nil {
+			if progress != nil {
+				progress(pipeline.ProgressEvent{StepID: stepID, Status: pipeline.StepStatusFailed, Err: err})
+			}
 			return fmt.Errorf("run command %q: %w", strings.Join(command, " "), err)
+		}
+		if progress != nil {
+			progress(pipeline.ProgressEvent{StepID: stepID, Status: pipeline.StepStatusSucceeded})
 		}
 	}
 
@@ -1960,8 +1972,10 @@ func selectedSkillIDs(selection model.Selection) []model.SkillID {
 func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection model.Selection, resolved planner.ResolvedPlan) ([]string, error) {
 	paths := map[string]struct{}{}
 	adapters := resolveAdapters(resolved.Agents)
+	managesSDDPlugins := false
 
 	for _, component := range resolved.OrderedComponents {
+		managesSDDPlugins = managesSDDPlugins || component == model.ComponentSDD
 		for _, path := range componentPathsWithWorkspaceScoped(homeDir, workspaceDir, scope, selection, adapters, component) {
 			paths[path] = struct{}{}
 		}
@@ -1983,12 +1997,31 @@ func backupTargets(homeDir, workspaceDir string, scope InstallScope, selection m
 		if component == model.ComponentPersona {
 			plan := persona.ResourcePlanFor(selection.Persona)
 			for _, adapter := range adapters {
+				if adapter.Agent() == model.AgentOpenCode || adapter.Agent() == model.AgentKilocode {
+					// Persona can merge or clean a managed agent in settings during
+					// install. This is backup-only: ComponentPersona verification
+					// does not promise a settings write for every persona path.
+					if path := adapter.SettingsPath(componentPathDirScoped(homeDir, workspaceDir, scope, adapter, model.ComponentPersona)); path != "" {
+						paths[path] = struct{}{}
+					}
+				}
 				if !adapter.SupportsOutputStyles() {
 					continue
 				}
 				for _, path := range plan.OutputStylePaths(adapter.OutputStyleDir(componentPathDirScoped(homeDir, workspaceDir, scope, adapter, model.ComponentPersona))).Backup {
 					paths[path] = struct{}{}
 				}
+			}
+		}
+	}
+	if managesSDDPlugins {
+		for _, adapter := range adapters {
+			if !sdd.AgentReceivesManagedOpenCodePlugins(adapter.Agent()) {
+				continue
+			}
+			pluginsDir := filepath.Join(adapter.GlobalConfigDir(componentPathDirScoped(homeDir, workspaceDir, scope, adapter, model.ComponentSDD)), "plugins")
+			for _, name := range sdd.OpenCodePluginLifecycleNames(adapter.Agent()) {
+				paths[filepath.Join(pluginsDir, name)] = struct{}{}
 			}
 		}
 	}
@@ -2229,6 +2262,11 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 				}
 			}
 			paths = append(paths, sddSubAgentPaths(targetDir, adapter)...)
+			if adapter.Agent() == model.AgentCodex {
+				// SDD installs the Codex skill-registry hook outside the skills
+				// directory, so it must share the component's backup contract.
+				paths = append(paths, filepath.Join(adapter.GlobalConfigDir(homeDir), "hooks.json"))
+			}
 		case model.ComponentSkills:
 			for _, skillID := range selectedSkillIDs(selection) {
 				if skills.IsSDDSkill(skillID) {
@@ -2306,9 +2344,7 @@ func componentPathsWithWorkspaceScoped(homeDir, workspaceDir string, scope Insta
 				paths = append(paths, p)
 			}
 		case model.ComponentClaudeTheme:
-			if adapter.Agent() == model.AgentClaudeCode {
-				paths = append(paths, filepath.Join(homeDir, ".claude", "themes", "gentleman.json"))
-			}
+			paths = append(paths, theme.VisualThemePaths(homeDir, adapter)...)
 		case model.ComponentOpenCodeGentleLogo:
 			paths = append(paths,
 				filepath.Join(homeDir, ".config", "opencode", "tui-plugins", "gentle-logo.tsx"),
@@ -2484,8 +2520,9 @@ func sddSubAgentPaths(homeDir string, adapter agents.Adapter) []string {
 }
 
 func openCodeSDDPluginPaths(targetDir string) []string {
-	// Legacy plugin first: installOpenCodePlugins removes it, and verification
-	// asserts its absence (isLegacyOpenCodeBackgroundAgentsPlugin).
+	// Legacy background-agents is removed during installation and therefore has
+	// an absence check. The retired reviewer plugin is part of the rollback
+	// snapshot but not post-apply verification because migration removes it.
 	paths := []string{filepath.Join(targetDir, ".config", "opencode", "plugins", "background-agents.ts")}
 	for _, name := range sdd.ManagedOpenCodePluginNames() {
 		paths = append(paths, filepath.Join(targetDir, ".config", "opencode", "plugins", name))
@@ -2698,13 +2735,11 @@ func (s checkDependenciesStep) Run() error {
 	// failing with real error messages.
 	_ = system.DetectDependencies(context.Background(), s.profile)
 	for _, agent := range s.selection.Agents {
-		// Only Pi still executes anything on the user's behalf (its own
-		// already-present `pi` subcommands, which need npm/pnpm — see
-		// agentInstallStep). Every other agent's "not installed" outcome is
-		// now a printed refusal, which needs no local dependency at all, so
-		// failing this whole pipeline early over an unrelated agent's
-		// missing npm/uv would abort work agentInstallStep would otherwise
-		// complete correctly by just naming the command.
+		// Only Pi executes package commands (its already-present `pi`
+		// subcommands and npm-based Engram initialization — see
+		// agentInstallStep). Other selected agents receive configuration without
+		// runtime acquisition, so their missing package managers must not block
+		// this pipeline.
 		if agent != model.AgentPi {
 			continue
 		}

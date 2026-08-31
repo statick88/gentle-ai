@@ -52,6 +52,9 @@ type SyncFlags struct {
 
 	OpenCodeBackgroundSubagents    string
 	OpenCodeBackgroundSubagentsSet bool
+
+	PiBackgroundSubagents    string
+	PiBackgroundSubagentsSet bool
 	// Profiles holds named SDD profiles parsed from --profile flags.
 	// Each entry is populated by parseProfileFlag and augmented by
 	// parseProfilePhaseFlag.
@@ -90,6 +93,8 @@ type SyncResult struct {
 
 	Background              OpenCodeBackgroundResolution
 	BackgroundPolicyEnabled bool
+
+	PiBackground PiBackgroundResolution
 }
 
 // ParseSyncFlags parses the CLI arguments for the sync subcommand.
@@ -115,6 +120,7 @@ func ParseSyncFlags(args []string) (SyncFlags, error) {
 	fs.BoolVar(&opts.IncludePermissions, "include-permissions", false, "include permissions component in sync")
 	fs.BoolVar(&opts.IncludeTheme, "include-theme", false, "include theme component in sync")
 	fs.StringVar(&opts.OpenCodeBackgroundSubagents, "opencode-background-subagents", "", "--opencode-background-subagents=auto|on|off; env: GENTLE_AI_OPENCODE_BACKGROUND_SUBAGENTS; eligible versions use a managed launcher")
+	fs.StringVar(&opts.PiBackgroundSubagents, "pi-background-subagents", "", "--pi-background-subagents=auto|on|off; env: GENTLE_AI_PI_BACKGROUND_SUBAGENTS; the resolved policy is projected for gentle-pi")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "preview plan without executing")
 	registerListFlag(fs, "profile", &opts.rawProfiles)
 	registerListFlag(fs, "profile-phase", &opts.rawProfilePhases)
@@ -147,6 +153,8 @@ func ParseSyncFlags(args []string) (SyncFlags, error) {
 			opts.themeSet = true
 		case "opencode-background-subagents":
 			opts.OpenCodeBackgroundSubagentsSet = true
+		case "pi-background-subagents":
+			opts.PiBackgroundSubagentsSet = true
 		}
 	})
 
@@ -189,6 +197,9 @@ FLAGS
   --opencode-background-subagents=auto|on|off
                                      Resolve OpenCode capability and manage a launcher when eligible; env: GENTLE_AI_OPENCODE_BACKGROUND_SUBAGENTS
                                      auto inherits managed on/off, unsupported/unknown stays foreground, off removes only owned launchers
+  --pi-background-subagents=auto|on|off
+                                     Project the resolved Pi background-subagent policy for gentle-pi; env: GENTLE_AI_PI_BACKGROUND_SUBAGENTS
+                                     auto inherits managed on/off and never enables by itself; only managed policy files are ever overwritten
   --dry-run                          Preview plan without executing
   --help, -h                         Show this help
 `)
@@ -486,10 +497,11 @@ type syncRuntime struct {
 	state                *runtimeState
 	managedPaths         []string
 	changedFiles         []string // accumulates candidate paths reported by component injectors
-	openCodeRuntime      *state.OpenCodeRuntimeProvenance
 	backgroundPolicy     bool
 	backgroundActivation *opencodeactivation.ActivationPlan
 	runtimeReady         bool
+
+	piBackgroundProjection *piBackgroundProjectionPlan
 }
 
 func newSyncRuntime(homeDir string, selection model.Selection) (*syncRuntime, error) {
@@ -508,13 +520,6 @@ func newSyncRuntime(homeDir string, selection model.Selection) (*syncRuntime, er
 		agentIDs:     selection.Agents,
 		backupRoot:   backupRoot,
 		state:        &runtimeState{compatibilityTransaction: compatibilityTransaction},
-	}
-	if hasOpenCodeReviewerPlugin(selection.Agents) {
-		provenance, err := captureOpenCodeRuntimeProvenance()
-		if err != nil {
-			return nil, fmt.Errorf("capture OpenCode reviewer runtime provenance: %w", err)
-		}
-		runtime.openCodeRuntime = provenance
 	}
 	return runtime, nil
 }
@@ -544,6 +549,9 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 	}
 	if r.backgroundActivation != nil {
 		apply = append(apply, openCodeBackgroundActivationStep{id: "sync:opencode:background-activation", plan: r.backgroundActivation, state: r.state, ready: &r.runtimeReady})
+	}
+	if r.piBackgroundProjection != nil {
+		apply = append(apply, piBackgroundProjectionStep{id: "sync:pi:background-projection", plan: r.piBackgroundProjection})
 	}
 
 	for _, component := range r.selection.Components {
@@ -643,6 +651,14 @@ func syncBackupTargets(homeDir, workspaceDir string, selection model.Selection, 
 		if component == model.ComponentPersona {
 			plan := persona.ResourcePlanFor(selection.Persona)
 			for _, adapter := range adapters {
+				if adapter.Agent() == model.AgentOpenCode || adapter.Agent() == model.AgentKilocode {
+					// Persona sync can remove stale managed agent state from settings.
+					// This target is backup-only: syncPersonaPaths intentionally does
+					// not make best-effort cleanup a post-sync verification target.
+					if path := adapter.SettingsPath(componentInjectionDir(homeDir, workspaceDir, adapter)); path != "" {
+						paths[path] = struct{}{}
+					}
+				}
 				if !adapter.SupportsOutputStyles() {
 					continue
 				}
@@ -668,7 +684,7 @@ func syncBackupTargets(homeDir, workspaceDir string, selection model.Selection, 
 			continue
 		}
 		pluginsDir := filepath.Join(adapter.GlobalConfigDir(homeDir), "plugins")
-		for _, name := range sdd.ManagedOpenCodePluginNames() {
+		for _, name := range sdd.OpenCodePluginLifecycleNames(adapter.Agent()) {
 			paths[filepath.Join(pluginsDir, name)] = struct{}{}
 		}
 	}
@@ -751,11 +767,9 @@ func syncAdapterSkillBackupTargets(homeDir, workspaceDir string, selection model
 // syncComponentPaths declares the file paths sync writes for a given component.
 //
 // For most components the contract is identical to install (componentPaths).
-// ComponentPersona is the exception: sync calls persona.InjectForSync which
-// skips the OpenCode/Kilocode agent definition in opencode.json (those JSON
-// merges remain install-only because they conflict with SDD's writes to the
-// same file). Sync therefore must NOT declare those JSON paths or the post-sync
-// verification will look for files sync never promised to write.
+// ComponentPersona is the exception: sync calls persona.InjectForSync rather
+// than merging persona definitions. Its narrow OpenCode cleanup remains a
+// backup-only transaction target, not a post-sync verification path.
 func syncComponentPaths(homeDir string, selection model.Selection, adapters []agents.Adapter, component model.ComponentID) []string {
 	return syncComponentPathsWithWorkspace(homeDir, "", selection, adapters, component)
 }
@@ -774,8 +788,8 @@ func syncComponentPathsWithWorkspace(homeDir, workspaceDir string, selection mod
 //   - Step 3: managed output-style overlay (only when the agent supports it).
 //   - Pi: the project-local gentle-pi persona state file.
 //
-// Step 2 (OpenCode/Kilocode agent definition in opencode.json) is install-only
-// and intentionally NOT declared here.
+// Step 2 does not merge OpenCode/Kilocode persona definitions during sync. A
+// narrow stale-state cleanup is tracked separately as a backup-only target.
 func syncPersonaPaths(homeDir string, selection model.Selection, adapters []agents.Adapter) []string {
 	return syncPersonaPathsWithWorkspace(homeDir, "", selection, adapters)
 }
@@ -1205,9 +1219,9 @@ func (s componentSyncStep) Run() error {
 
 	case model.ComponentClaudeTheme:
 		for _, adapter := range adapters {
-			res, err := theme.InjectClaudeTheme(s.homeDir, adapter)
+			res, err := theme.InjectVisualThemes(s.homeDir, adapter)
 			if err != nil {
-				return fmt.Errorf("sync Claude theme for %q: %w", adapter.Agent(), err)
+				return fmt.Errorf("sync visual themes for %q: %w", adapter.Agent(), err)
 			}
 			s.countChanged(boolToInt(res.Changed), res.Files...)
 		}
@@ -1519,10 +1533,15 @@ func RunSyncWithSelection(homeDir string, selection model.Selection) (SyncResult
 	if err != nil {
 		return SyncResult{Agents: selection.Agents, Selection: selection, Background: background}, fmt.Errorf("prepare OpenCode background activation: %w", err)
 	}
-	return runSyncWithSelection(homeDir, selection, background)
+	piBackground, err := resolvePiBackgroundCLI(false, "", persistedState)
+	if err != nil {
+		return SyncResult{Agents: selection.Agents, Selection: selection, Background: background}, err
+	}
+	preparePiBackgroundProjection(homeDir, &piBackground, containsAgent(selection.Agents, model.AgentPi))
+	return runSyncWithSelection(homeDir, selection, background, piBackground)
 }
 
-func runSyncWithSelection(homeDir string, selection model.Selection, background OpenCodeBackgroundResolution) (SyncResult, error) {
+func runSyncWithSelection(homeDir string, selection model.Selection, background OpenCodeBackgroundResolution, piBackground PiBackgroundResolution) (SyncResult, error) {
 	agentIDs := selection.Agents
 	// The read error is captured, not discarded: the persona alias migration
 	// below must not rewrite state it could not read. Managed-asset provenance
@@ -1553,9 +1572,10 @@ func runSyncWithSelection(homeDir string, selection model.Selection, background 
 	}
 
 	result := SyncResult{
-		Agents:     agentIDs,
-		Selection:  selection,
-		Background: background,
+		Agents:       agentIDs,
+		Selection:    selection,
+		Background:   background,
+		PiBackground: piBackground,
 	}
 
 	result, noOp, err := zeroAgentSyncNoOp(homeDir, selection, result)
@@ -1577,6 +1597,7 @@ func runSyncWithSelection(homeDir string, selection model.Selection, background 
 		// supplies an activation plan; direct callers do not.
 		rt.backgroundPolicy = background.Effective == model.OpenCodeBackgroundOn
 	}
+	rt.piBackgroundProjection = piBackground.projectionPlan
 
 	stagePlan := rt.stagePlan()
 	result.Plan = stagePlan
@@ -1603,6 +1624,9 @@ func runSyncWithSelection(homeDir string, selection model.Selection, background 
 	result.ChangedFiles = dedupPaths(append(result.ChangedFiles, compatibilityChanged...))
 	if background.activationPlan != nil {
 		result.ChangedFiles = dedupPaths(append(result.ChangedFiles, background.activationPlan.ChangedPaths()...))
+	}
+	if piBackground.projectionPlan != nil {
+		result.ChangedFiles = dedupPaths(append(result.ChangedFiles, piBackground.projectionPlan.ChangedPaths()...))
 	}
 	result.FilesChanged = len(result.ChangedFiles)
 
@@ -1634,7 +1658,7 @@ func runSyncWithSelection(homeDir string, selection model.Selection, background 
 	if err != nil {
 		return result, fmt.Errorf("derive managed asset writer identity: %w", err)
 	}
-	if err := persistSyncManagedAssetStateWithBackground(homeDir, selection, writer, rt.openCodeRuntime, background.Persist); err != nil {
+	if err := persistSyncManagedAssetStateWithBackground(homeDir, selection, writer, background.Persist, piBackground.Persist); err != nil {
 		persistErr := fmt.Errorf("persist sync managed asset state: %w", err)
 		rollback := orchestrator.Rollback(result.Execution)
 		if rollback.Err != nil {
@@ -1646,7 +1670,7 @@ func runSyncWithSelection(homeDir string, selection model.Selection, background 
 	return result, nil
 }
 
-func persistSyncManagedAssetStateWithBackground(homeDir string, selection model.Selection, writer string, runtimeProvenance *state.OpenCodeRuntimeProvenance, background model.OpenCodeBackgroundIntent) error {
+func persistSyncManagedAssetStateWithBackground(homeDir string, selection model.Selection, writer string, background model.OpenCodeBackgroundIntent, piBackground model.PiBackgroundIntent) error {
 	return withInstallStateLock(homeDir, func() error {
 		latest, err := state.Read(homeDir)
 		if errors.Is(err, os.ErrNotExist) {
@@ -1669,11 +1693,6 @@ func persistSyncManagedAssetStateWithBackground(homeDir string, selection model.
 			latest.ManagedAssetDigest = writer
 			shouldWrite = true
 		}
-		if runtimeProvenance != nil && (latest.OpenCodeRuntimeProvenance == nil || *latest.OpenCodeRuntimeProvenance != *runtimeProvenance) {
-			provenance := *runtimeProvenance
-			latest.OpenCodeRuntimeProvenance = &provenance
-			shouldWrite = true
-		}
 		if !latest.CommunityToolsConfigured && selection.CommunityTools != nil {
 			latest.CommunityTools = communityToolIDsToStrings(selection.CommunityTools)
 			latest.CommunityToolsConfigured = true
@@ -1681,6 +1700,10 @@ func persistSyncManagedAssetStateWithBackground(homeDir string, selection model.
 		}
 		if background != "" && latest.BackgroundIntent != background {
 			latest.BackgroundIntent = background
+			shouldWrite = true
+		}
+		if piBackground != "" && latest.PiBackgroundIntent != piBackground {
+			latest.PiBackgroundIntent = piBackground
 			shouldWrite = true
 		}
 		if !shouldWrite {
@@ -1730,6 +1753,10 @@ func RunSync(args []string) (SyncResult, error) {
 		return SyncResult{Agents: agentIDs, Selection: selection}, err
 	}
 	background, err := resolveOpenCodeBackgroundCLI(flags.OpenCodeBackgroundSubagentsSet, flags.OpenCodeBackgroundSubagents, persistedState)
+	if err != nil {
+		return SyncResult{Agents: agentIDs, Selection: selection}, err
+	}
+	piBackground, err := resolvePiBackgroundCLI(flags.PiBackgroundSubagentsSet, flags.PiBackgroundSubagents, persistedState)
 	if err != nil {
 		return SyncResult{Agents: agentIDs, Selection: selection}, err
 	}
@@ -1813,10 +1840,11 @@ func RunSync(args []string) (SyncResult, error) {
 	if flags.DryRun {
 		// Build the plan for inspection, skip execution.
 		result := SyncResult{
-			Agents:     agentIDs,
-			Selection:  selection,
-			DryRun:     true,
-			Background: background,
+			Agents:       agentIDs,
+			Selection:    selection,
+			DryRun:       true,
+			Background:   background,
+			PiBackground: piBackground,
 		}
 		result, noOp, err := zeroAgentSyncNoOp(homeDir, selection, result)
 		if err != nil || noOp {
@@ -1837,6 +1865,8 @@ func RunSync(args []string) (SyncResult, error) {
 		rt.backgroundPolicy = rt.runtimeReady && background.Effective == model.OpenCodeBackgroundOn
 		result.Background = background
 		result.BackgroundPolicyEnabled = rt.backgroundPolicy
+		rt.piBackgroundProjection = preparePiBackgroundProjection(homeDir, &piBackground, containsAgent(agentIDs, model.AgentPi))
+		result.PiBackground = piBackground
 		result.Plan = rt.stagePlan()
 		for _, step := range result.Plan.Prepare {
 			if prepare, ok := step.(prepareBackupStep); ok && prepare.targetErr != nil {
@@ -1851,7 +1881,8 @@ func RunSync(args []string) (SyncResult, error) {
 		return SyncResult{Agents: agentIDs, Selection: selection, Background: background}, fmt.Errorf("prepare OpenCode background activation: %w", err)
 	}
 	background.activationPlan = backgroundActivation
-	result, err := runSyncWithSelection(homeDir, selection, background)
+	preparePiBackgroundProjection(homeDir, &piBackground, containsAgent(agentIDs, model.AgentPi))
+	result, err := runSyncWithSelection(homeDir, selection, background, piBackground)
 	if err != nil {
 		return result, err
 	}
@@ -1925,6 +1956,14 @@ func hasManagedPiCodeGraphManifest(homeDir string) bool {
 func RenderSyncReport(result SyncResult) string {
 	var b strings.Builder
 	backgroundReport := func() {
+		if containsAgent(result.Agents, model.AgentPi) && result.PiBackground.Intent != "" {
+			fmt.Fprintf(&b, "Pi background intent: %s (policy effective: %s)\n", result.PiBackground.Intent, result.PiBackground.Effective)
+			if !result.PiBackground.managed {
+				fmt.Fprintln(&b, "Pi background projection: unmanaged (no explicit policy)")
+			} else if plan := result.PiBackground.projectionPlan; plan != nil && plan.skipReason != "" {
+				fmt.Fprintln(&b, "Pi background projection skipped: "+plan.skipReason)
+			}
+		}
 		if !containsAgent(result.Agents, model.AgentOpenCode) || result.Background.Intent == "" {
 			return
 		}
@@ -2050,6 +2089,25 @@ func runPostSyncVerification(homeDir, workspaceDir string, selection model.Selec
 				},
 			})
 		}
+	}
+	for _, adapter := range adapters {
+		if !sdd.AgentReceivesManagedOpenCodePlugins(adapter.Agent()) {
+			continue
+		}
+		pluginsDir := filepath.Join(adapter.GlobalConfigDir(homeDir), "plugins")
+		legacyPath := filepath.Join(pluginsDir, sdd.LegacyOpenCodeReviewPluginName)
+		checks = append(checks, verify.Check{
+			ID:          "verify:sync:file:" + legacyPath,
+			Description: "legacy OpenCode review plugin removed",
+			Run: func(context.Context) error {
+				if _, err := os.Lstat(legacyPath); err == nil {
+					return fmt.Errorf("legacy OpenCode review plugin still exists; rerun `gentle-ai sync` to complete the managed plugin migration")
+				} else if !os.IsNotExist(err) {
+					return err
+				}
+				return nil
+			},
+		})
 	}
 
 	return verify.BuildReport(verify.RunChecks(context.Background(), checks))

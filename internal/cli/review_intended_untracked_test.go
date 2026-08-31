@@ -74,6 +74,7 @@ func executePrintedReview(t *testing.T, repo, command string) []byte {
 }
 
 func TestIntendedUntrackedPreflightRequiresExplicitIntentBeforeAuthority(t *testing.T) {
+	reviewEnabledHome(t)
 	repo := initReviewCLIRepo(t)
 	writeUndeclaredWorkspaceFile(t, repo, "candidate, with space.txt", "candidate\n", 0o644)
 	writeUndeclaredWorkspaceFile(t, repo, unrelatedCredentialPath, unrelatedCredentialContents, 0o600)
@@ -125,6 +126,7 @@ func TestNegotiatedStatusUnbornUntrackedRequiresSelectionBeforeSnapshot(t *testi
 }
 
 func TestIntendedUntrackedSelectionUsesCanonicalPathsAndPrintedStart(t *testing.T) {
+	reviewEnabledHome(t)
 	repo := initReviewCLIRepo(t)
 	writeUndeclaredWorkspaceFile(t, repo, "docs/chosen, file.md", "# Chosen\n", 0o644)
 	writeUndeclaredWorkspaceFile(t, repo, "docs/second file,with comma.md", "# Second\n", 0o644)
@@ -151,12 +153,13 @@ func TestIntendedUntrackedSelectionUsesCanonicalPathsAndPrintedStart(t *testing.
 		t.Fatalf("selected transition = %#v, want executable START", selected.NextTransition)
 	}
 	started := decodeNegotiatedReviewStart(t, executePrintedReview(t, repo, selected.NextTransition.Execute.Command))
-	if negotiatedStartTarget(started) != selected.TargetIdentity {
-		t.Fatalf("printed START target = %s, negotiated target = %s", negotiatedStartTarget(started), selected.TargetIdentity)
+	if started.State != reviewtransaction.StateApproved || started.Action != "closed" {
+		t.Fatalf("printed zero-lens START = %#v", started)
 	}
 }
 
 func TestIntendedUntrackedInventoryChangesFailClosedBeforeAuthority(t *testing.T) {
+	reviewEnabledHome(t)
 	for _, test := range []struct {
 		name   string
 		remove bool
@@ -182,6 +185,7 @@ func TestIntendedUntrackedInventoryChangesFailClosedBeforeAuthority(t *testing.T
 }
 
 func TestIntendedUntrackedInvalidIntentNeverCreatesAuthority(t *testing.T) {
+	reviewEnabledHome(t)
 	cases := [][]string{
 		{"missing mode", "--expected-untracked-inventory=<digest>"},
 		{"missing digest", "--untracked-scope=exclude"},
@@ -208,7 +212,34 @@ func TestIntendedUntrackedInvalidIntentNeverCreatesAuthority(t *testing.T) {
 	}
 }
 
+func TestIntendedUntrackedSelectWithoutPathsNamesSelectedPathContinuation(t *testing.T) {
+	reviewEnabledHome(t)
+	repo := initReviewCLIRepo(t)
+	writeUndeclaredWorkspaceFile(t, repo, "candidate.txt", "candidate\n", 0o644)
+	digest, _ := intendedUntrackedSelection(t, intendedUntrackedStatus(t, repo))
+	err := RunReviewFacadeStart([]string{
+		"--cwd", repo, "--lineage", "select-without-path", "--untracked-scope=select", "--expected-untracked-inventory=" + digest,
+	}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("selection without paths started review")
+	}
+	for _, want := range []string{
+		"--untracked-scope=select",
+		"--intended-untracked=<repo-relative-path>",
+		"--expected-untracked-inventory=" + digest,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("select-without-path guidance = %q, missing %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "--untracked-scope=exclude") {
+		t.Fatalf("select-without-path guidance changed the selected mode: %q", err)
+	}
+	assertNoUntrackedSelectionAuthority(t, repo)
+}
+
 func TestIntendedUntrackedConsentFollowUpPreservesSelectedScope(t *testing.T) {
+	reviewEnabledHome(t)
 	repo := initReviewCLIRepo(t)
 	path := "scripts/deploy candidate.sh"
 	writeUndeclaredWorkspaceFile(t, repo, path, "#!/bin/sh\necho deploy\n", 0o755)
